@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <thread>
+#include <spirv-tools/libspirv.hpp>
 
 /*****************************************************************************/
 /* PERFETTO GLOBAL VARIABLES *************************************************/
@@ -98,6 +99,44 @@ static void writeKernelOnDisk(
     fclose(file);
 }
 
+static void writeSpirvOnDisk(const char *dir, std::string &program_name, const void *il, size_t length)
+{
+    TRACE_EVENT(CLKP_PERFETTO_CATEGORY, "writeSpirvOnDisk", "dir", perfetto::DynamicString(dir), "program",
+        perfetto::DynamicString(program_name));
+    std::filesystem::path filename(dir);
+    if (!std::filesystem::exists(filename)) {
+        PRINT("'%s' does not exist, could not write SPIR-V on disk", dir);
+        return;
+    }
+
+    // Write the raw SPIR-V binary
+    filename /= program_name;
+    filename += ".spv";
+    FILE *file = fopen(filename.c_str(), "wb");
+    if (file) {
+        fwrite(il, 1, length, file);
+        fclose(file);
+    }
+
+    // Disassemble and write the assembly
+    spvtools::SpirvTools tools(SPV_ENV_OPENCL_2_0);
+    std::string disassembly;
+    const uint32_t* spirv_data = static_cast<const uint32_t*>(il);
+    size_t spirv_words = length / sizeof(uint32_t);
+
+    if (tools.Disassemble(spirv_data, spirv_words, &disassembly)) {
+        std::filesystem::path asm_filename = filename;
+        asm_filename.replace_extension(".spvasm");
+        FILE *asm_file = fopen(asm_filename.c_str(), "w");
+        if (asm_file) {
+            fwrite(disassembly.c_str(), 1, disassembly.length(), asm_file);
+            fclose(asm_file);
+        }
+    } else {
+        PRINT("Failed to disassemble SPIR-V for program %s", program_name.c_str());
+    }
+}
+
 static uint32_t program_number = 0;
 static std::map<cl_program, std::string> program_to_string;
 static cl_program clkp_clCreateProgramWithSource(
@@ -118,6 +157,28 @@ static cl_program clkp_clCreateProgramWithSource(
         TRACE_EVENT_INSTANT(CLKP_PERFETTO_CATEGORY, "clCreateProgramWithSource-args", "program",
             perfetto::DynamicString(program_str), "string", perfetto::DynamicString(strings[i]));
     }
+    return program;
+}
+
+static cl_program clkp_clCreateProgramWithIL(
+    cl_context context, const void *il, size_t length, cl_int *errcode_ret)
+{
+    std::lock_guard<std::mutex> lock(g_lock);
+    std::string program_str = std::string("clkp_p") + std::to_string(program_number++);
+    TRACE_EVENT(CLKP_PERFETTO_CATEGORY, "clCreateProgramWithIL", "program", perfetto::DynamicString(program_str),
+        "length", length);
+
+    if (auto dir = getenv("CLKP_KERNEL_DIR")) {
+        writeSpirvOnDisk(dir, program_str, il, length);
+    }
+
+    cl_program program = tdispatch->clCreateProgramWithIL(context, il, length, errcode_ret);
+    program_to_string[program] = program_str;
+
+    // Log SPIR-V info as trace event
+    TRACE_EVENT_INSTANT(CLKP_PERFETTO_CATEGORY, "clCreateProgramWithIL-args", "program",
+        perfetto::DynamicString(program_str), "il_size", length);
+
     return program;
 }
 
@@ -469,6 +530,7 @@ CL_API_ENTRY cl_int CL_API_CALL clInitLayer(cl_uint num_entries, const struct _c
 
     memset(&dispatch, 0, sizeof(dispatch));
     dispatch.clCreateProgramWithSource = clkp_clCreateProgramWithSource;
+    dispatch.clCreateProgramWithIL = clkp_clCreateProgramWithIL;
     dispatch.clCreateKernel = clkp_clCreateKernel;
     dispatch.clEnqueueNDRangeKernel = clkp_clEnqueueNDRangeKernel;
     dispatch.clCreateCommandQueue = clkp_clCreateCommandQueue;

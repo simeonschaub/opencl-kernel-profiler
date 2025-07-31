@@ -30,9 +30,15 @@ if (NOT PERFETTO_LIBRARY)
   set(PERFETTO_LIBRARY perfetto)
 endif()
 
+# Find SPIRV-Tools library
+find_library(SPIRV_TOOLS_LIBRARY NAMES SPIRV-Tools libSPIRV-Tools)
+if (NOT SPIRV_TOOLS_LIBRARY)
+  message(FATAL_ERROR "SPIRV-Tools library not found")
+endif()
+
 add_library (opencl-kernel-profiler MODULE src/opencl-kernel-profiler.cpp)
 target_include_directories(opencl-kernel-profiler PUBLIC ${PERFETTO_SDK_PATH} ${OPENCL_HEADER_PATH})
-target_link_libraries(opencl-kernel-profiler ${PERFETTO_LIBRARY})
+target_link_libraries(opencl-kernel-profiler ${PERFETTO_LIBRARY} ${SPIRV_TOOLS_LIBRARY})
 
 set(BACKEND "InProcess"
   CACHE STRING "Select perfetto backend")
