@@ -81,21 +81,15 @@ static void writeKernelOnDisk(
     TRACE_EVENT(CLKP_PERFETTO_CATEGORY, "writeKernelOnDisk", "dir", perfetto::DynamicString(dir), "program",
         perfetto::DynamicString(program_name));
 
-    // Use simple string operations instead of filesystem::path
     std::string filename = std::string(dir) + "/" + program_name + ".cl";
     FILE *file = fopen(filename.c_str(), "w");
     if (!file) {
-        PRINT("Could not create file '%s'", filename.c_str());
         return;
     }
 
     for (unsigned i = 0; i < count; i++) {
-        size_t size_written = 0;
-        const uint8_t *data = (const uint8_t *)strings[i];
         size_t code_size = lengths == nullptr ? strlen(strings[i]) : lengths[i];
-        do {
-            size_written += fwrite(&data[size_written], 1, code_size - size_written, file);
-        } while (size_written != code_size);
+        fwrite(strings[i], 1, code_size, file);
     }
     fclose(file);
 }
@@ -105,7 +99,7 @@ static void writeSpirvOnDisk(const char *dir, std::string &program_name, const v
     TRACE_EVENT(CLKP_PERFETTO_CATEGORY, "writeSpirvOnDisk", "dir", perfetto::DynamicString(dir), "program",
         perfetto::DynamicString(program_name));
 
-    // Use string concatenation instead of filesystem operations to avoid corruption
+    // Use string concatenation instead of filesystem operations
     std::string base_filename = std::string(dir) + "/" + program_name;
     std::string spv_filename = base_filename + ".spv";
 
@@ -131,24 +125,18 @@ static void writeSpirvOnDisk(const char *dir, std::string &program_name, const v
         return;
     }
 
-    try {
-        spvtools::SpirvTools tools(SPV_ENV_OPENCL_2_0);
-        std::string disassembly;
+    spvtools::SpirvTools tools(SPV_ENV_OPENCL_2_2);
+    std::string disassembly;
 
-        if (tools.Disassemble(spirv_data, spirv_words, &disassembly)) {
-            std::string asm_filename = base_filename + ".spvasm";
-            FILE *asm_file = fopen(asm_filename.c_str(), "w");
-            if (asm_file) {
-                fwrite(disassembly.c_str(), 1, disassembly.length(), asm_file);
-                fclose(asm_file);
-            }
-        } else {
-            PRINT("Failed to disassemble SPIR-V for program %s", program_name.c_str());
+    if (tools.Disassemble(spirv_data, spirv_words, &disassembly)) {
+        std::string asm_filename = base_filename + ".spvasm";
+        FILE *asm_file = fopen(asm_filename.c_str(), "w");
+        if (asm_file) {
+            fwrite(disassembly.c_str(), 1, disassembly.length(), asm_file);
+            fclose(asm_file);
         }
-    } catch (const std::bad_alloc& e) {
-        PRINT("Memory allocation failed during SPIR-V disassembly for program %s", program_name.c_str());
-    } catch (const std::exception& e) {
-        PRINT("Exception during SPIR-V disassembly for program %s: %s", program_name.c_str(), e.what());
+    } else {
+        PRINT("Failed to disassemble SPIR-V for program %s", program_name.c_str());
     }
 }
 
