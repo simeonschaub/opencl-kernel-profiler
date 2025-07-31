@@ -57,7 +57,13 @@ static const struct _cl_icd_dispatch *tdispatch;
 
 #define PRINT(message, ...)                                                                                            \
     do {                                                                                                               \
-        fprintf(stderr, "[CLKP] %s: " message "\n", __func__, ##__VA_ARGS__);                                          \
+        fprintf(stderr, "[CLKP] %s: " message "\n", __func__, ##__VA_ARGS__);                                         \
+    } while (0)
+#define PRINT_VERBOSE(message, ...)                                                                                    \
+    do {                                                                                                               \
+        if (getenv("CLKP_VERBOSE")) {                                                                                  \
+            fprintf(stderr, "[CLKP] %s: " message "\n", __func__, ##__VA_ARGS__);                                     \
+        }                                                                                                              \
     } while (0)
 #define CHECK(test, statement, message, ...)                                                                           \
     do {                                                                                                               \
@@ -252,7 +258,7 @@ static void callback(cl_event event, cl_int event_command_exec_status, void *use
             std::string name = std::string(data->program_string) + "-" + std::string(data->kernel_name) + "-" +
                               std::to_string(data->gidX) + "." + std::to_string(data->gidY) + "." + std::to_string(data->gidZ);
 
-            PRINT("Kernel started: %s at %llu ns", name.c_str(), (unsigned long long)start_time);
+            PRINT_VERBOSE("Kernel started: %s at %llu ns", name.c_str(), (unsigned long long)start_time);
 
             // Start the Perfetto trace event for kernel execution
             TRACE_EVENT_BEGIN(CLKP_PERFETTO_CATEGORY, perfetto::DynamicString(name),
@@ -269,7 +275,7 @@ static void callback(cl_event event, cl_int event_command_exec_status, void *use
             if (err == CL_SUCCESS) {
                 data->start_time = start_time;
                 data->started = true;
-                PRINT("Kernel start time recovered at completion: %llu ns", (unsigned long long)start_time);
+                PRINT_VERBOSE("Kernel start time recovered at completion: %llu ns", (unsigned long long)start_time);
             }
         }
 
@@ -318,7 +324,7 @@ static void trace_callback(callback_data *data)
         // Calculate execution duration
         double duration_ms = (end_time - data->start_time) / 1000000.0; // Convert nanoseconds to milliseconds
 
-        PRINT("Kernel completed: %s, Duration: %.3f ms, Start: %llu ns, End: %llu ns",
+        PRINT_VERBOSE("Kernel completed: %s, Duration: %.3f ms, Start: %llu ns, End: %llu ns",
               name.c_str(), duration_ms, (unsigned long long)data->start_time, (unsigned long long)end_time);
 
         // If we missed the CL_RUNNING callback, create a complete duration event
@@ -334,7 +340,7 @@ static void trace_callback(callback_data *data)
         TRACE_EVENT_END(CLKP_PERFETTO_CATEGORY, perfetto::Track((uintptr_t)queue), (uint64_t)end_time);
     } else {
         // Fallback: if we didn't get the start event, create a simple instant event
-        PRINT("Kernel completed: %s (no start time available), End: %llu ns",
+        PRINT_VERBOSE("Kernel completed: %s (no start time available), End: %llu ns",
               name.c_str(), (unsigned long long)end_time);
 
         TRACE_EVENT_INSTANT(CLKP_PERFETTO_CATEGORY, perfetto::DynamicString(name),
