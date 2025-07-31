@@ -218,6 +218,10 @@ struct callback_data {
     cl_kernel kernel;
     cl_event event;
     size_t gidX, gidY, gidZ;
+    char *kernel_name;      // Use C-style strings to avoid constructor/destructor issues
+    char *program_string;   // Use C-style strings to avoid constructor/destructor issues
+    cl_ulong start_time;    // Track when kernel started running
+    bool started;           // Flag to track if we've seen the start event
 };
 
 struct ThreadInfo {
@@ -236,13 +240,47 @@ static void callback(cl_event event, cl_int event_command_exec_status, void *use
 
     struct callback_data *data = (struct callback_data *)user_data;
     assert(data != nullptr);
-    assert(event_command_exec_status == CL_COMPLETE);
-    cl_command_queue queue = data->queue;
-    ThreadInfo *thread_info = queue_to_thread_info[queue];
-    {
-        std::lock_guard<std::mutex> lock(thread_info->lock);
-        thread_info->callbacks.push(data);
-        thread_info->cv.notify_all();
+
+    if (event_command_exec_status == CL_RUNNING) {
+        // Kernel started running - get the start time and log it
+        cl_ulong start_time;
+        cl_int err = tdispatch->clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start_time), &start_time, nullptr);
+        if (err == CL_SUCCESS) {
+            data->start_time = start_time;
+            data->started = true;
+
+            std::string name = std::string(data->program_string) + "-" + std::string(data->kernel_name) + "-" +
+                              std::to_string(data->gidX) + "." + std::to_string(data->gidY) + "." + std::to_string(data->gidZ);
+
+            PRINT("Kernel started: %s at %llu ns", name.c_str(), (unsigned long long)start_time);
+
+            // Start the Perfetto trace event for kernel execution
+            TRACE_EVENT_BEGIN(CLKP_PERFETTO_CATEGORY, perfetto::DynamicString(name),
+                             perfetto::Track((uintptr_t)data->queue), (uint64_t)start_time,
+                             "program", perfetto::DynamicString(data->program_string),
+                             "kernel_name", perfetto::DynamicString(data->kernel_name),
+                             "gidX", data->gidX, "gidY", data->gidY, "gidZ", data->gidZ);
+        }
+    } else if (event_command_exec_status == CL_COMPLETE) {
+        // If we missed the CL_RUNNING event, try to get the start time here
+        if (!data->started) {
+            cl_ulong start_time;
+            cl_int err = tdispatch->clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start_time), &start_time, nullptr);
+            if (err == CL_SUCCESS) {
+                data->start_time = start_time;
+                data->started = true;
+                PRINT("Kernel start time recovered at completion: %llu ns", (unsigned long long)start_time);
+            }
+        }
+
+        // Kernel completed - queue for processing in background thread
+        cl_command_queue queue = data->queue;
+        ThreadInfo *thread_info = queue_to_thread_info[queue];
+        {
+            std::lock_guard<std::mutex> lock(thread_info->lock);
+            thread_info->callbacks.push(data);
+            thread_info->cv.notify_all();
+        }
     }
 }
 
@@ -269,37 +307,44 @@ static void trace_callback(callback_data *data)
     cl_event event = data->event;
     size_t gidX = data->gidX, gidY = data->gidY, gidZ = data->gidZ;
 
-    cl_ulong start, end;
-    cl_int err;
-    err = tdispatch->clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start), &start, nullptr);
-    CHECK_CL(err, return, "clGetEventProfilingInfo(CL_PROFILING_COMMAND_START) failed (%i)", err);
-    err = tdispatch->clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr);
+    cl_ulong end_time;
+    cl_int err = tdispatch->clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end_time), &end_time, nullptr);
     CHECK_CL(err, return, "clGetEventProfilingInfo(CL_PROFILING_COMMAND_END) failed (%i)", err);
-    if (end < start) {
-        TRACE_EVENT_INSTANT(CLKP_PERFETTO_CATEGORY, perfetto::StaticString("INVALID_TIMESTAMPS"),
-            perfetto::Track((uintptr_t)queue), "start", start, "end", end);
-        return;
+
+    std::string name = std::string(data->program_string) + "-" + std::string(data->kernel_name) + "-" +
+                      std::to_string(gidX) + "." + std::to_string(gidY) + "." + std::to_string(gidZ);
+
+    if (data->started && end_time >= data->start_time) {
+        // Calculate execution duration
+        double duration_ms = (end_time - data->start_time) / 1000000.0; // Convert nanoseconds to milliseconds
+
+        PRINT("Kernel completed: %s, Duration: %.3f ms, Start: %llu ns, End: %llu ns",
+              name.c_str(), duration_ms, (unsigned long long)data->start_time, (unsigned long long)end_time);
+
+        // If we missed the CL_RUNNING callback, create a complete duration event
+        if (data->start_time > 0) {
+            TRACE_EVENT_BEGIN(CLKP_PERFETTO_CATEGORY, perfetto::DynamicString(name),
+                             perfetto::Track((uintptr_t)queue), (uint64_t)data->start_time,
+                             "program", perfetto::DynamicString(data->program_string),
+                             "kernel_name", perfetto::DynamicString(data->kernel_name),
+                             "gidX", gidX, "gidY", gidY, "gidZ", gidZ);
+        }
+
+        // End the Perfetto trace event
+        TRACE_EVENT_END(CLKP_PERFETTO_CATEGORY, perfetto::Track((uintptr_t)queue), (uint64_t)end_time);
+    } else {
+        // Fallback: if we didn't get the start event, create a simple instant event
+        PRINT("Kernel completed: %s (no start time available), End: %llu ns",
+              name.c_str(), (unsigned long long)end_time);
+
+        TRACE_EVENT_INSTANT(CLKP_PERFETTO_CATEGORY, perfetto::DynamicString(name),
+                           perfetto::Track((uintptr_t)queue), (uint64_t)end_time,
+                           "program", perfetto::DynamicString(data->program_string),
+                           "kernel_name", perfetto::DynamicString(data->kernel_name),
+                           "gidX", gidX, "gidY", gidY, "gidZ", gidZ);
     }
 
-    std::string kernel_name = "?";
-    if (kernel_to_kernel_name.count(kernel)) {
-        kernel_name = kernel_to_kernel_name[kernel];
-    }
-
-    std::string program_string = "clkp_p?";
-    if (kernel_to_program.count(kernel) && program_to_string.count(kernel_to_program[kernel])) {
-        program_string = program_to_string[kernel_to_program[kernel]];
-    }
-
-    std::string name = program_string + "-" + kernel_name + "-" + std::to_string(gidX) + "." + std::to_string(gidY)
-        + "." + std::to_string(gidZ);
-
-    TRACE_EVENT_BEGIN(CLKP_PERFETTO_CATEGORY, perfetto::DynamicString(name), perfetto::Track((uintptr_t)queue),
-        (uint64_t)start, "program", perfetto::DynamicString(program_string), "kernel_name",
-        perfetto::DynamicString(kernel_name), "gidX", gidX, "gidY", gidY, "gidZ", gidZ);
-    TRACE_EVENT_END(CLKP_PERFETTO_CATEGORY, perfetto::Track((uintptr_t)queue), (uint64_t)end);
-
-    tdispatch->clReleaseEvent(event);
+    // Don't release the event here - OpenCL manages the event lifecycle
 }
 
 static void queue_thread_function(ThreadInfo *thread_info)
@@ -311,6 +356,8 @@ static void queue_thread_function(ThreadInfo *thread_info)
             return;
         }
         trace_callback(data);
+        free(data->kernel_name);
+        free(data->program_string);
         free(data);
     }
 }
@@ -333,33 +380,64 @@ static cl_int clkp_clEnqueueNDRangeKernel(cl_command_queue command_queue, cl_ker
         CHECK_ALLOC(event, return CL_OUT_OF_HOST_MEMORY);
     }
 
-    cl_int err = tdispatch->clEnqueueNDRangeKernel(command_queue, kernel, work_dim, global_work_offset,
-        global_work_size, local_work_size, num_events_in_wait_list, event_wait_list, event);
-
-    struct callback_data *data = nullptr;
-    auto clean = [&data, &event_is_null, &err, &event](bool clean_user_data = true) {
-        if (clean_user_data) {
+    // Create the callback data before enqueuing the kernel
+    struct callback_data *data = (struct callback_data *)malloc(sizeof(struct callback_data));
+    auto clean = [&data, &event_is_null, &event]() {
+        if (data) {
+            free(data->kernel_name);
+            free(data->program_string);
             free(data);
         }
-        if (!event_is_null) {
-            tdispatch->clRetainEvent(*event);
+        if (event_is_null && event) {
+            free(event);
         }
     };
-    CHECK_CL(err, clean(); return err, "clEnqueueNDRangeKernel failed (%i)", err);
+    CHECK_ALLOC(data, clean(); return CL_OUT_OF_HOST_MEMORY);
 
-    data = (struct callback_data *)malloc(sizeof(struct callback_data));
-    CHECK_ALLOC(data, clean(); return err);
     data->queue = command_queue;
     data->kernel = kernel;
-    data->event = *event;
     data->gidX = gidX;
     data->gidY = gidY;
     data->gidZ = gidZ;
+    data->started = false;
+    data->start_time = 0;
+
+    // Get kernel and program names for the callback
+    const char *kernel_name_str = "?";
+    const char *program_string_str = "clkp_p?";
+
+    if (kernel_to_kernel_name.count(kernel)) {
+        kernel_name_str = kernel_to_kernel_name[kernel].c_str();
+    }
+
+    if (kernel_to_program.count(kernel) && program_to_string.count(kernel_to_program[kernel])) {
+        program_string_str = program_to_string[kernel_to_program[kernel]].c_str();
+    }
+
+    data->kernel_name = strdup(kernel_name_str);
+    data->program_string = strdup(program_string_str);
+
+    if (!data->kernel_name || !data->program_string) {
+        free(data->kernel_name);
+        free(data->program_string);
+        clean();
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+
+    cl_int err = tdispatch->clEnqueueNDRangeKernel(command_queue, kernel, work_dim, global_work_offset,
+        global_work_size, local_work_size, num_events_in_wait_list, event_wait_list, event);
+
+    CHECK_CL(err, clean(); return err, "clEnqueueNDRangeKernel failed (%i)", err);
+
+    // Now set the event in the callback data and register callbacks
+    data->event = *event;
+
+    cl_int err_cb_running = tdispatch->clSetEventCallback(*event, CL_RUNNING, callback, data);
+    CHECK_CL(err_cb_running, clean(); return err, "clSetEventCallback(CL_RUNNING) failed (%i)", err_cb_running);
 
     cl_int err_cb = tdispatch->clSetEventCallback(*event, CL_COMPLETE, callback, data);
     CHECK_CL(err_cb, clean(); return err, "clSetEventCallback failed (%i)", err_cb);
 
-    clean(false);
     return err;
 }
 
