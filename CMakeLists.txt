@@ -17,6 +17,16 @@ project (opencl-kernel-profiler)
 
 set(CMAKE_CXX_STANDARD 17)
 
+# Add debug information and disable optimizations for better debugging
+set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG" CACHE STRING "Debug CXX flags")
+set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG" CACHE STRING "Debug C flags")
+
+# Alternative: You can also force debug symbols regardless of build type
+# Uncomment the lines below if you want debug symbols even in Release builds
+# target_compile_options(opencl-kernel-profiler PRIVATE -g)
+# target_compile_options(perfetto PRIVATE -g)
+
 if (NOT PERFETTO_SDK_PATH)
   message(FATAL_ERROR "PERFETTO_SDK_PATH not defined")
 endif ()

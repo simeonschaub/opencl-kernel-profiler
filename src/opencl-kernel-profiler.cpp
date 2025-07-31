@@ -80,14 +80,15 @@ static void writeKernelOnDisk(
 {
     TRACE_EVENT(CLKP_PERFETTO_CATEGORY, "writeKernelOnDisk", "dir", perfetto::DynamicString(dir), "program",
         perfetto::DynamicString(program_name));
-    std::filesystem::path filename(dir);
-    if (!std::filesystem::exists(filename)) {
-        PRINT("'%s' does not exist, could not write kernel on disk", dir);
+
+    // Use simple string operations instead of filesystem::path
+    std::string filename = std::string(dir) + "/" + program_name + ".cl";
+    FILE *file = fopen(filename.c_str(), "w");
+    if (!file) {
+        PRINT("Could not create file '%s'", filename.c_str());
         return;
     }
-    filename /= program_name;
-    filename += ".cl";
-    FILE *file = fopen(filename.c_str(), "w");
+
     for (unsigned i = 0; i < count; i++) {
         size_t size_written = 0;
         const uint8_t *data = (const uint8_t *)strings[i];
@@ -103,37 +104,51 @@ static void writeSpirvOnDisk(const char *dir, std::string &program_name, const v
 {
     TRACE_EVENT(CLKP_PERFETTO_CATEGORY, "writeSpirvOnDisk", "dir", perfetto::DynamicString(dir), "program",
         perfetto::DynamicString(program_name));
-    std::filesystem::path filename(dir);
-    if (!std::filesystem::exists(filename)) {
-        PRINT("'%s' does not exist, could not write SPIR-V on disk", dir);
-        return;
-    }
+
+    // Use string concatenation instead of filesystem operations to avoid corruption
+    std::string base_filename = std::string(dir) + "/" + program_name;
+    std::string spv_filename = base_filename + ".spv";
 
     // Write the raw SPIR-V binary
-    filename /= program_name;
-    filename += ".spv";
-    FILE *file = fopen(filename.c_str(), "wb");
+    FILE *file = fopen(spv_filename.c_str(), "wb");
     if (file) {
         fwrite(il, 1, length, file);
         fclose(file);
     }
 
     // Disassemble and write the assembly
-    spvtools::SpirvTools tools(SPV_ENV_OPENCL_2_0);
-    std::string disassembly;
+    if (length < 20 || length % 4 != 0) {
+        PRINT("Invalid SPIR-V data size (%zu bytes) for program %s", length, program_name.c_str());
+        return;
+    }
+
     const uint32_t* spirv_data = static_cast<const uint32_t*>(il);
     size_t spirv_words = length / sizeof(uint32_t);
 
-    if (tools.Disassemble(spirv_data, spirv_words, &disassembly)) {
-        std::filesystem::path asm_filename = filename;
-        asm_filename.replace_extension(".spvasm");
-        FILE *asm_file = fopen(asm_filename.c_str(), "w");
-        if (asm_file) {
-            fwrite(disassembly.c_str(), 1, disassembly.length(), asm_file);
-            fclose(asm_file);
+    // Basic SPIR-V header validation (magic number)
+    if (spirv_words < 5 || spirv_data[0] != 0x07230203) {
+        PRINT("Invalid SPIR-V magic number for program %s", program_name.c_str());
+        return;
+    }
+
+    try {
+        spvtools::SpirvTools tools(SPV_ENV_OPENCL_2_0);
+        std::string disassembly;
+
+        if (tools.Disassemble(spirv_data, spirv_words, &disassembly)) {
+            std::string asm_filename = base_filename + ".spvasm";
+            FILE *asm_file = fopen(asm_filename.c_str(), "w");
+            if (asm_file) {
+                fwrite(disassembly.c_str(), 1, disassembly.length(), asm_file);
+                fclose(asm_file);
+            }
+        } else {
+            PRINT("Failed to disassemble SPIR-V for program %s", program_name.c_str());
         }
-    } else {
-        PRINT("Failed to disassemble SPIR-V for program %s", program_name.c_str());
+    } catch (const std::bad_alloc& e) {
+        PRINT("Memory allocation failed during SPIR-V disassembly for program %s", program_name.c_str());
+    } catch (const std::exception& e) {
+        PRINT("Exception during SPIR-V disassembly for program %s: %s", program_name.c_str(), e.what());
     }
 }
 
@@ -164,22 +179,34 @@ static cl_program clkp_clCreateProgramWithIL(
     cl_context context, const void *il, size_t length, cl_int *errcode_ret)
 {
     std::lock_guard<std::mutex> lock(g_lock);
-    std::string program_str = std::string("clkp_p") + std::to_string(program_number++);
-    TRACE_EVENT(CLKP_PERFETTO_CATEGORY, "clCreateProgramWithIL", "program", perfetto::DynamicString(program_str),
-        "length", length);
 
-    if (auto dir = getenv("CLKP_KERNEL_DIR")) {
-        writeSpirvOnDisk(dir, program_str, il, length);
+    try {
+        std::string program_str = std::string("clkp_p") + std::to_string(program_number++);
+
+        TRACE_EVENT(CLKP_PERFETTO_CATEGORY, "clCreateProgramWithIL", "program", perfetto::StaticString(program_str.c_str()),
+            "length", length);
+
+        if (auto dir = getenv("CLKP_KERNEL_DIR")) {
+            writeSpirvOnDisk(dir, program_str, il, length);
+        }
+
+        cl_program program = tdispatch->clCreateProgramWithIL(context, il, length, errcode_ret);
+        program_to_string[program] = std::move(program_str);
+
+        // Log SPIR-V info as trace event
+        TRACE_EVENT_INSTANT(CLKP_PERFETTO_CATEGORY, "clCreateProgramWithIL-args", "program",
+            perfetto::StaticString(program_to_string[program].c_str()), "il_size", length);
+
+        return program;
+    } catch (const std::bad_alloc& e) {
+        PRINT("Memory allocation failed in clCreateProgramWithIL");
+        if (errcode_ret) *errcode_ret = CL_OUT_OF_HOST_MEMORY;
+        return nullptr;
+    } catch (const std::exception& e) {
+        PRINT("Exception in clCreateProgramWithIL: %s", e.what());
+        if (errcode_ret) *errcode_ret = CL_INVALID_VALUE;
+        return nullptr;
     }
-
-    cl_program program = tdispatch->clCreateProgramWithIL(context, il, length, errcode_ret);
-    program_to_string[program] = program_str;
-
-    // Log SPIR-V info as trace event
-    TRACE_EVENT_INSTANT(CLKP_PERFETTO_CATEGORY, "clCreateProgramWithIL-args", "program",
-        perfetto::DynamicString(program_str), "il_size", length);
-
-    return program;
 }
 
 static uint32_t kernel_number = 0;
