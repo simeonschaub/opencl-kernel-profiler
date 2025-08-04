@@ -17,6 +17,11 @@ project (opencl-kernel-profiler)
 
 set(CMAKE_CXX_STANDARD 17)
 
+# needed to to pick up perfetto when compiled as a shared library on windows
+if (WIN32)
+  set(CMAKE_FIND_LIBRARY_SUFFIXES ".dll" ${CMAKE_FIND_LIBRARY_SUFFIXES})
+endif()
+
 if (NOT PERFETTO_SDK_PATH)
   message(FATAL_ERROR "PERFETTO_SDK_PATH not defined")
 endif ()
