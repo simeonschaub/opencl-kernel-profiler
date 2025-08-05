@@ -476,7 +476,11 @@ CL_API_ENTRY cl_int CL_API_CALL clGetLayerInfo(
         if (param_value) {
             if (param_value_size < sizeof(cl_layer_api_version))
                 return CL_INVALID_VALUE;
+#ifdef CL_LAYER_API_VERSION_200
+            *((cl_layer_api_version *)param_value) = CL_LAYER_API_VERSION_200;
+#else
             *((cl_layer_api_version *)param_value) = CL_LAYER_API_VERSION_100;
+#endif
         }
         if (param_value_size_ret)
             *param_value_size_ret = sizeof(cl_layer_api_version);
@@ -487,7 +491,11 @@ CL_API_ENTRY cl_int CL_API_CALL clGetLayerInfo(
     return CL_SUCCESS;
 }
 
+#ifdef CL_LAYER_API_VERSION_200
+CL_API_ENTRY cl_int CL_API_CALL clDeinitLayer()
+#else
 void clDeinitLayer()
+#endif
 {
 #ifdef BACKEND_INPROCESS
     gTracingSession->StopBlocking();
@@ -499,6 +507,9 @@ void clDeinitLayer()
     output.close();
 #else
     perfetto::TrackEvent::Flush();
+#endif
+#ifdef CL_LAYER_API_VERSION_200
+    return CL_SUCCESS;
 #endif
 }
 
@@ -555,8 +566,10 @@ CL_API_ENTRY cl_int CL_API_CALL clInitLayer(cl_uint num_entries, const struct _c
     *layer_dispatch_ret = &dispatch;
     *num_entries_out = sizeof(dispatch) / sizeof(dispatch.clGetPlatformIDs);
 
+#ifndef CL_LAYER_API_VERSION_200
     bool atexit_registered = atexit(clDeinitLayer) == 0;
     CHECK(atexit_registered, return CL_OUT_OF_RESOURCES, "Could not register clDeinitLayer using atexit()");
+#endif
 
     return CL_SUCCESS;
 }
