@@ -465,6 +465,44 @@ static const uint32_t get_trace_max_size()
 #endif
 
 /*****************************************************************************/
+/* PERFETTO TRACING FUNCTIONS ************************************************/
+/*****************************************************************************/
+
+extern "C"
+{
+void startTracing()
+{
+#ifdef BACKEND_INPROCESS
+    perfetto::protos::gen::TrackEventConfig track_event_cfg;
+    perfetto::TraceConfig cfg;
+    cfg.add_buffers()->set_size_kb(get_trace_max_size());
+    auto *ds_cfg = cfg.add_data_sources()->mutable_config();
+    ds_cfg->set_name("track_event");
+    ds_cfg->set_track_event_config_raw(track_event_cfg.SerializeAsString());
+
+    gTracingSession = perfetto::Tracing::NewTrace();
+    gTracingSession->Setup(cfg);
+    gTracingSession->StartBlocking();
+#endif
+}
+
+void stopTracing()
+{
+#ifdef BACKEND_INPROCESS
+    gTracingSession->StopBlocking();
+    std::vector<char> trace_data(gTracingSession->ReadTraceBlocking());
+
+    std::ofstream output;
+    output.open(get_trace_dest(), std::ios::out | std::ios::binary);
+    output.write(&trace_data[0], trace_data.size());
+    output.close();
+#else
+    perfetto::TrackEvent::Flush();
+#endif
+}
+}
+
+/*****************************************************************************/
 /* LAYER FUNCTIONS ***********************************************************/
 /*****************************************************************************/
 
@@ -487,21 +525,6 @@ CL_API_ENTRY cl_int CL_API_CALL clGetLayerInfo(
     return CL_SUCCESS;
 }
 
-void clDeinitLayer()
-{
-#ifdef BACKEND_INPROCESS
-    gTracingSession->StopBlocking();
-    std::vector<char> trace_data(gTracingSession->ReadTraceBlocking());
-
-    std::ofstream output;
-    output.open(get_trace_dest(), std::ios::out | std::ios::binary);
-    output.write(&trace_data[0], trace_data.size());
-    output.close();
-#else
-    perfetto::TrackEvent::Flush();
-#endif
-}
-
 CL_API_ENTRY cl_int CL_API_CALL clInitLayer(cl_uint num_entries, const struct _cl_icd_dispatch *target_dispatch,
     cl_uint *num_entries_out, const struct _cl_icd_dispatch **layer_dispatch_ret)
 {
@@ -520,18 +543,7 @@ CL_API_ENTRY cl_int CL_API_CALL clInitLayer(cl_uint num_entries, const struct _c
     perfetto::Tracing::Initialize(args);
     perfetto::TrackEvent::Register();
 
-#ifdef BACKEND_INPROCESS
-    perfetto::protos::gen::TrackEventConfig track_event_cfg;
-    perfetto::TraceConfig cfg;
-    cfg.add_buffers()->set_size_kb(get_trace_max_size());
-    auto *ds_cfg = cfg.add_data_sources()->mutable_config();
-    ds_cfg->set_name("track_event");
-    ds_cfg->set_track_event_config_raw(track_event_cfg.SerializeAsString());
-
-    gTracingSession = perfetto::Tracing::NewTrace();
-    gTracingSession->Setup(cfg);
-    gTracingSession->StartBlocking();
-#endif
+    startTracing();
 
     const uint32_t max_retry = 100;
     uint32_t retry = 0;
@@ -555,8 +567,8 @@ CL_API_ENTRY cl_int CL_API_CALL clInitLayer(cl_uint num_entries, const struct _c
     *layer_dispatch_ret = &dispatch;
     *num_entries_out = sizeof(dispatch) / sizeof(dispatch.clGetPlatformIDs);
 
-    bool atexit_registered = atexit(clDeinitLayer) == 0;
-    CHECK(atexit_registered, return CL_OUT_OF_RESOURCES, "Could not register clDeinitLayer using atexit()");
+    bool atexit_registered = atexit(stopTracing) == 0;
+    CHECK(atexit_registered, return CL_OUT_OF_RESOURCES, "Could not register stopTracing using atexit()");
 
     return CL_SUCCESS;
 }
