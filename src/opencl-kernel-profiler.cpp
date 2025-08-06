@@ -227,7 +227,7 @@ static void callback(cl_event event, cl_int event_command_exec_status, void *use
     assert(event_command_exec_status == CL_COMPLETE);
     cl_command_queue queue = data->queue;
     ThreadInfo *thread_info = queue_to_thread_info[queue];
-    {
+    if (thread_info) {
         std::lock_guard<std::mutex> lock(thread_info->lock);
         thread_info->callbacks.push(data);
         thread_info->cv.notify_all();
@@ -368,15 +368,17 @@ static cl_int clkp_clReleaseCommandQueue(cl_command_queue command_queue)
     auto ret = tdispatch->clReleaseCommandQueue(command_queue);
 
     ThreadInfo *thread_info = queue_to_thread_info[command_queue];
-    {
-        std::lock_guard<std::mutex> lock(thread_info->lock);
-        thread_info->stop = true;
-        thread_info->cv.notify_all();
+    if (thread_info) {
+        {
+            std::lock_guard<std::mutex> lock(thread_info->lock);
+            thread_info->stop = true;
+            thread_info->cv.notify_all();
+        }
+        queue_to_thread[command_queue].join();
+        queue_to_thread.erase(command_queue);
+        queue_to_thread_info.erase(command_queue);
+        delete thread_info;
     }
-    queue_to_thread[command_queue].join();
-    queue_to_thread.erase(command_queue);
-    queue_to_thread_info.erase(command_queue);
-    delete thread_info;
 
     return ret;
 }
